@@ -20,16 +20,15 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 from engine.coreutils import (
-    setup_logger, PoseKeypoints, GarmentMeta,
+    setup_logger, PoseKeypoints, Keypoint, GarmentMeta,
     FPSCounter, FrameCache, ensure_bgra, create_placeholder_shirt,
     alpha_blend,
 )
 from engine.yolo_pose import YoloPoseEngine, AsyncPoseEngine
-from engine.densepose_engine import DensePoseEngine
-from engine.parsing_engine import ParsingEngine
+from engine.densepose_engine import DensePoseEngine, TorsoMap
+from engine.parsing_engine import ParsingEngine, ParsedRegions
 from engine.garment_landmarks import GarmentAnalyzer, GarmentLandmarks
 from engine.hybrid_warper import HybridWarper
-from engine.occlusion_engine import OcclusionEngine
 from engine.shadow_engine import ShadowEngine
 
 logger = setup_logger("pipeline")
@@ -89,7 +88,6 @@ class RenderPipeline:
         self._parsing = ParsingEngine(model_path=parsing_model, device=device)
         self._garment_analyzer = GarmentAnalyzer()
         self._warper = HybridWarper(smooth_alpha=0.35, physics_lag=0.2, tps_smooth=0.1)
-        self._occlusion = OcclusionEngine(feather_radius=14)
         self._shadow = ShadowEngine(shadow_intensity=0.35)
 
         self._garments: List[GarmentEntry] = []
@@ -323,13 +321,26 @@ class RenderPipeline:
                        np.zeros((0, 0), dtype=np.uint8)).shape != (h, w)
         )
         if cache_invalid or self._frame_count % self._parse_frame_skip == 0:
-            self._last_parsing = self._parsing.parse(frame, pose)
-            self._last_torso = self._densepose.estimate(
-                frame, pose, parsing_mask=self._last_parsing,
+            roi = self._compute_pose_roi(frame.shape[:2], pose, pad_ratio=0.12)
+            x1, y1, x2, y2 = roi
+            roi_frame = frame[y1:y2, x1:x2]
+            roi_pose = self._translate_pose(pose, dx=-x1, dy=-y1)
+
+            parsed_roi = self._parsing.parse(roi_frame, roi_pose)
+            torso_roi = self._densepose.estimate(
+                roi_frame, roi_pose, parsing_mask=parsed_roi,
+            )
+
+            self._last_parsing = self._project_parsed_to_frame(
+                parsed_roi, frame_shape=frame.shape[:2], roi=roi
+            )
+            self._last_torso = self._project_torso_to_frame(
+                torso_roi, frame_shape=frame.shape[:2], roi=roi
             )
 
         parsed = self._last_parsing
         torso_map = self._last_torso
+        fit_torso_mask = self._build_fit_torso_mask(frame.shape[:2], parsed, torso_map, pose)
 
         # ── Warp Shirt ────────────────────────────────────────────────────────
         t_warp = time.perf_counter()
@@ -338,6 +349,7 @@ class RenderPipeline:
             garment.landmarks,
             pose,
             frame.shape,           # (h, w, c) — warper uses [:2]
+            torso_mask=fit_torso_mask,
         )
         self.stats.warp_ms = (time.perf_counter() - t_warp) * 1000
 
@@ -357,25 +369,29 @@ class RenderPipeline:
             )
 
         # ── Occlusion Masks ───────────────────────────────────────────────────
-        occlusion_masks = self._occlusion.build_occlusion_masks(
-            frame, pose, parsed, torso_map
-        )
+        blended_shirt = warped_shirt
+        if blended_shirt.shape[2] == 4 and self.opacity < 0.999:
+            blended_shirt = blended_shirt.copy()
+            alpha = blended_shirt[:, :, 3].astype(np.float32) * float(np.clip(self.opacity, 0.0, 1.0))
+            blended_shirt[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
 
         # ── Composite ─────────────────────────────────────────────────────────
-        result = self._occlusion.composite(
+        result = alpha_blend(
             result,
-            warped_shirt,
-            warp_result.placement_x,
-            warp_result.placement_y,
-            occlusion_masks,
-            opacity=self.opacity,
+            blended_shirt,
+            x=warp_result.placement_x,
+            y=warp_result.placement_y,
         )
 
         # ── Shadows ───────────────────────────────────────────────────────────
+        shirt_region = self._build_shirt_region_mask(
+            frame_shape=frame.shape[:2],
+            shirt=blended_shirt,
+            x=warp_result.placement_x,
+            y=warp_result.placement_y,
+        )
+
         if self.enable_shadows:
-            shirt_region = occlusion_masks.get(
-                "shirt_region", np.zeros(frame.shape[:2], dtype=np.uint8)
-            )
             result = self._shadow.apply_shadows(
                 result, shirt_region, pose, warped_shirt
             )
@@ -390,6 +406,231 @@ class RenderPipeline:
         return result, self.stats
 
     # ── Debug / Helpers ──────────────────────────────────────────────────────
+
+    def _build_shirt_region_mask(
+        self,
+        frame_shape: Tuple[int, int],
+        shirt: np.ndarray,
+        x: int,
+        y: int,
+    ) -> np.ndarray:
+        h, w = frame_shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if shirt is None or shirt.size == 0:
+            return mask
+
+        sh, sw = shirt.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(w, x + sw), min(h, y + sh)
+        if x2 <= x1 or y2 <= y1:
+            return mask
+
+        sx1 = x1 - x
+        sy1 = y1 - y
+        sx2 = sx1 + (x2 - x1)
+        sy2 = sy1 + (y2 - y1)
+
+        if shirt.shape[2] == 4:
+            shirt_alpha = shirt[sy1:sy2, sx1:sx2, 3]
+            mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], shirt_alpha)
+        else:
+            mask[y1:y2, x1:x2] = 255
+
+        return mask
+
+    def _build_fit_torso_mask(
+        self,
+        frame_shape: Tuple[int, int],
+        parsed: Any,
+        torso_map: Any,
+        pose: Optional[PoseKeypoints] = None,
+    ) -> np.ndarray:
+        h, w = frame_shape
+        fit = np.zeros((h, w), dtype=np.uint8)
+
+        if torso_map is not None:
+            tm = getattr(torso_map, "torso_mask", None)
+            if tm is not None:
+                t = np.asarray(tm)
+                if t.ndim == 3:
+                    t = t[:, :, 0]
+                if t.shape != (h, w):
+                    t = cv2.resize(t, (w, h), interpolation=cv2.INTER_NEAREST)
+                fit = np.maximum(fit, t.astype(np.uint8))
+
+        if parsed is not None:
+            pm = getattr(parsed, "torso", None)
+            if pm is not None:
+                p = np.asarray(pm)
+                if p.ndim == 3:
+                    p = p[:, :, 0]
+                if p.shape != (h, w):
+                    p = cv2.resize(p, (w, h), interpolation=cv2.INTER_NEAREST)
+                fit = np.maximum(fit, p.astype(np.uint8))
+
+        if np.any(fit > 10):
+            contours, _ = cv2.findContours((fit > 10).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                hull = cv2.convexHull(largest)
+                hull_mask = np.zeros_like(fit)
+                cv2.fillConvexPoly(hull_mask, hull, 255)
+                fit = np.maximum(fit, hull_mask)
+
+        # Constrain fit mask using live pose torso ROI so TPS doesn't overfit to leaked regions.
+        if pose is not None:
+            ls = pose.left_shoulder
+            rs = pose.right_shoulder
+            lh = pose.left_hip
+            rh = pose.right_hip
+            if ls and rs and ls.valid and rs.valid:
+                sw = max(20.0, float(pose.shoulder_width))
+                top_y = int(max(0, min(ls.y, rs.y) - sw * 0.20))
+                if lh and rh and lh.valid and rh.valid:
+                    bottom_y = int(min(h - 1, max(lh.y, rh.y) + sw * 0.25))
+                    center_x = int((ls.x + rs.x + lh.x + rh.x) / 4.0)
+                    half_top = int(sw * 0.75)
+                    half_bottom = int(sw * 0.90)
+                else:
+                    bottom_y = int(min(h - 1, max(ls.y, rs.y) + sw * 1.65))
+                    center_x = int((ls.x + rs.x) / 2.0)
+                    half_top = int(sw * 0.78)
+                    half_bottom = int(sw * 0.85)
+
+                roi_poly = np.array([
+                    [center_x - half_top, top_y],
+                    [center_x + half_top, top_y],
+                    [center_x + half_bottom, bottom_y],
+                    [center_x - half_bottom, bottom_y],
+                ], dtype=np.int32)
+                roi_poly[:, 0] = np.clip(roi_poly[:, 0], 0, w - 1)
+                roi_poly[:, 1] = np.clip(roi_poly[:, 1], 0, h - 1)
+                roi_mask = np.zeros_like(fit)
+                cv2.fillConvexPoly(roi_mask, roi_poly, 255)
+                fit = cv2.bitwise_and(fit, roi_mask)
+
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        fit = cv2.morphologyEx(fit, cv2.MORPH_CLOSE, kernel_close)
+        fit = cv2.morphologyEx(fit, cv2.MORPH_OPEN, kernel_open)
+        return fit
+
+    def _compute_pose_roi(
+        self,
+        frame_shape: Tuple[int, int],
+        pose: Optional[PoseKeypoints],
+        pad_ratio: float = 0.10,
+    ) -> Tuple[int, int, int, int]:
+        h, w = frame_shape
+        if pose is None:
+            return 0, 0, w, h
+
+        pts = []
+        for kp in getattr(pose, "keypoints", []) or []:
+            if kp is not None and kp.valid:
+                pts.append((float(kp.x), float(kp.y)))
+        if len(pts) < 2:
+            return 0, 0, w, h
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        pad = max(16.0, max(bw, bh) * float(np.clip(pad_ratio, 0.05, 0.35)))
+
+        rx1 = int(max(0, np.floor(x1 - pad)))
+        ry1 = int(max(0, np.floor(y1 - pad)))
+        rx2 = int(min(w, np.ceil(x2 + pad)))
+        ry2 = int(min(h, np.ceil(y2 + pad)))
+
+        min_side = 192
+        if (rx2 - rx1) < min_side:
+            cx = (rx1 + rx2) // 2
+            half = min_side // 2
+            rx1 = max(0, cx - half)
+            rx2 = min(w, rx1 + min_side)
+            rx1 = max(0, rx2 - min_side)
+        if (ry2 - ry1) < min_side:
+            cy = (ry1 + ry2) // 2
+            half = min_side // 2
+            ry1 = max(0, cy - half)
+            ry2 = min(h, ry1 + min_side)
+            ry1 = max(0, ry2 - min_side)
+
+        return rx1, ry1, rx2, ry2
+
+    def _translate_pose(self, pose: PoseKeypoints, dx: int, dy: int) -> PoseKeypoints:
+        kps: List[Keypoint] = []
+        for kp in pose.keypoints:
+            if kp is None:
+                kps.append(Keypoint(0.0, 0.0, 0.0))
+            else:
+                kps.append(Keypoint(x=kp.x + dx, y=kp.y + dy, confidence=kp.confidence))
+        return PoseKeypoints(keypoints=kps, confidence=pose.confidence)
+
+    def _project_mask_to_frame(
+        self,
+        mask: np.ndarray,
+        frame_shape: Tuple[int, int],
+        roi: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        h, w = frame_shape
+        x1, y1, x2, y2 = roi
+        out = np.zeros((h, w), dtype=np.uint8)
+        if mask is None:
+            return out
+        m = np.asarray(mask)
+        if m.ndim == 3:
+            m = m[:, :, 0]
+        th = max(1, y2 - y1)
+        tw = max(1, x2 - x1)
+        if m.shape != (th, tw):
+            m = cv2.resize(m, (tw, th), interpolation=cv2.INTER_NEAREST)
+        out[y1:y2, x1:x2] = m.astype(np.uint8)
+        return out
+
+    def _project_parsed_to_frame(
+        self,
+        parsed_roi: ParsedRegions,
+        frame_shape: Tuple[int, int],
+        roi: Tuple[int, int, int, int],
+    ) -> ParsedRegions:
+        h, w = frame_shape
+        projected = ParsedRegions(h, w, method=getattr(parsed_roi, "method", "parsing"))
+        projected.torso = self._project_mask_to_frame(parsed_roi.torso, frame_shape, roi)
+        projected.left_arm = self._project_mask_to_frame(parsed_roi.left_arm, frame_shape, roi)
+        projected.right_arm = self._project_mask_to_frame(parsed_roi.right_arm, frame_shape, roi)
+        projected.face = self._project_mask_to_frame(parsed_roi.face, frame_shape, roi)
+        projected.hair = self._project_mask_to_frame(parsed_roi.hair, frame_shape, roi)
+        projected.legs = self._project_mask_to_frame(parsed_roi.legs, frame_shape, roi)
+        return projected
+
+    def _project_torso_to_frame(
+        self,
+        torso_roi: TorsoMap,
+        frame_shape: Tuple[int, int],
+        roi: Tuple[int, int, int, int],
+    ) -> TorsoMap:
+        torso_mask = self._project_mask_to_frame(torso_roi.torso_mask, frame_shape, roi)
+        neck_mask = self._project_mask_to_frame(torso_roi.neck_mask, frame_shape, roi)
+        arm_masks = {
+            "left_arm": self._project_mask_to_frame(
+                (torso_roi.arm_masks or {}).get("left_arm"), frame_shape, roi
+            ),
+            "right_arm": self._project_mask_to_frame(
+                (torso_roi.arm_masks or {}).get("right_arm"), frame_shape, roi
+            ),
+        }
+        return TorsoMap(
+            torso_mask=torso_mask,
+            arm_masks=arm_masks,
+            neck_mask=neck_mask,
+            uv_map=None,
+            method=getattr(torso_roi, "method", "densepose"),
+            confidence=float(getattr(torso_roi, "confidence", 1.0)),
+        )
 
     def _overlay_mask(self, frame, mask, color, alpha=0.35):
         if mask is None:

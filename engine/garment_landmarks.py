@@ -216,7 +216,7 @@ class GarmentAnalyzer:
             return 0, 0, w, h
         y1, y2 = np.where(rows)[0][[0, -1]]
         x1, x2 = np.where(cols)[0][[0, -1]]
-        return int(x1), int(y1), int(x2), int(y2)
+        return int(x1), int(y1), int(x2) + 1, int(y2) + 1
 
     def _refine_collar_x(
         self,
@@ -264,12 +264,12 @@ class GarmentAnalyzer:
     ) -> Tuple[int, int]:
         """Find leftmost and rightmost shirt edges at shoulder height."""
         y = min(y, alpha.shape[0] - 1)
-        row = alpha[y, :]
+        row = alpha[y, x1:x2]
         opaque = row > 30
         if not opaque.any():
             return x1, x2
-        left = int(np.where(opaque)[0][0])
-        right = int(np.where(opaque)[0][-1])
+        left = int(np.where(opaque)[0][0])+ x1
+        right = int(np.where(opaque)[0][-1])+ x1
         return left, right
 
     def _find_sleeve_ends(
@@ -288,29 +288,24 @@ class GarmentAnalyzer:
         mid_x = (x1 + x2) // 2
 
         # Scan the left half
-        left_col = alpha[:sleeve_y, :mid_x]
+        left_col = alpha[shoulder_y:sleeve_y, x1:mid_x]
         left_mask = left_col > 30
         if left_mask.any():
             rows, cols = np.where(left_mask)
-            # Find leftmost column at approximately sleeve_y level
-            sleeve_rows = rows > shoulder_y
-            if sleeve_rows.any():
-                target_cols = cols[sleeve_rows]
-                sl_x = max(x1, int(np.min(target_cols)) - 5)
+            if len(cols) > 0:
+                sl_x = max(x1, int(np.min(cols)) + x1 - 5) 
             else:
                 sl_x = x1
         else:
             sl_x = x1
 
         # Right sleeve: find rightmost opaque in right half
-        right_col = alpha[:sleeve_y, mid_x:]
+        right_col = alpha[shoulder_y:sleeve_y, mid_x:x2]
         right_mask = right_col > 30
         if right_mask.any():
             rows, cols = np.where(right_mask)
-            sleeve_rows = rows > shoulder_y
-            if sleeve_rows.any():
-                target_cols = cols[sleeve_rows] + mid_x
-                sr_x = min(x2, int(np.max(target_cols)) + 5)
+            if len(cols) > 0:
+                sr_x = min(x2, int(np.max(cols)) + mid_x + 5)
             else:
                 sr_x = x2
         else:
