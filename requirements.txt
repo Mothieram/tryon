@@ -1,0 +1,34 @@
+# requirements.txt (CUDA 12.1 compatible)
+
+# Core Vision
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# AI / Deep Learning
+ultralytics>=8.0.0
+
+# PyTorch CUDA 12.1 install separately:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Scientific
+scipy>=1.11.0
+scikit-image>=0.21.0
+scikit-learn>=1.3.0
+
+# GUI
+customtkinter>=5.2.0
+
+# Utilities
+requests>=2.31.0
+tqdm>=4.65.0
+pyyaml>=6.0
+psutil>=5.9.0
+
+# ONNX GPU (CUDA compatible)
+onnxruntime-gpu>=1.18.0
+
+# Logging / Debug
+colorlog>=6.7.0
+matplotlib>=3.7.0
+imageio>=2.31.0
