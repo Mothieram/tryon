@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from engine.utils import setup_logger
+from engine.coreutils import setup_logger
 from engine.render_pipeline import RenderPipeline
 
 logger = setup_logger("main", level=logging.INFO)

@@ -9,7 +9,7 @@ import numpy as np
 import logging
 from typing import Optional, Tuple
 
-from engine.utils import setup_logger, PoseKeypoints, get_brightness, estimate_ambient_color
+from engine.coreutils import setup_logger, PoseKeypoints, get_brightness, estimate_ambient_color
 
 logger = setup_logger("shadow")
 

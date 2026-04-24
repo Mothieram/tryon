@@ -11,7 +11,7 @@ from typing import Optional, Dict, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from engine.utils import setup_logger, GarmentMeta
+from engine.coreutils import setup_logger, GarmentMeta
 
 logger = setup_logger("garment_landmarks")
 

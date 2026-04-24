@@ -15,7 +15,7 @@ from typing import Optional, List
 from pathlib import Path
 
 from engine.render_pipeline import RenderPipeline, PipelineStats
-from engine.utils import setup_logger
+from engine.coreutils import setup_logger
 
 logger = setup_logger("app")
 

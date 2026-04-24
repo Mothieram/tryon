@@ -12,7 +12,7 @@ from typing import Optional, List, Tuple, Dict,Any
 from pathlib import Path
 import threading
 
-from engine.utils import (
+from engine.coreutils import (
     setup_logger,
     Keypoint,
     PoseKeypoints,
